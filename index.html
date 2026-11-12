@@ -138,6 +138,9 @@
   <!-- Lucide Icons standalone library -->
   <script src="https://unpkg.com/lucide@latest"></script>
 
+  <!-- ZXing library fallback for devices without native BarcodeDetector -->
+  <script src="https://unpkg.com/@zxing/library@latest"></script>
+
   <style>
     /* Prevent rubber-band scroll on iOS body while allowing inner scroll */
     html, body {
@@ -164,6 +167,16 @@
     }
     .pb-safe {
       padding-bottom: env(safe-area-inset-bottom, 24px);
+    }
+
+    /* Live Barcode Scanner Laser Animation */
+    @keyframes scanner-laser {
+      0% { top: 6%; opacity: 0.8; }
+      50% { top: 92%; opacity: 1; }
+      100% { top: 6%; opacity: 0.8; }
+    }
+    .scanner-laser-line {
+      animation: scanner-laser 2s cubic-bezier(0.4, 0, 0.2, 1) infinite;
     }
   </style>
 </head>
@@ -344,6 +357,15 @@
       const [isAnalyzingPhoto, setIsAnalyzingPhoto] = useState(false);
       const [isEstimatingMealAI, setIsEstimatingMealAI] = useState(false);
       const [isScanningBarcode, setIsScanningBarcode] = useState(false);
+
+      // Live Barcode Scanner Modal State
+      const [showBarcodeScannerModal, setShowBarcodeScannerModal] = useState(false);
+      const [scannerTorchOn, setScannerTorchOn] = useState(false);
+      const [manualBarcodeCode, setManualBarcodeCode] = useState('');
+      const videoRef = useRef(null);
+      const mediaStreamRef = useRef(null);
+      const scanAnimationRef = useRef(null);
+      const isProcessingBarcodeRef = useRef(false);
 
       // Form States - Habits Date Selection
       const [lifestyleDate, setLifestyleDate] = useState(() => new Date().toISOString().split('T')[0]);
@@ -526,6 +548,250 @@
         setTimeout(() => {
           window.location.reload(true);
         }, 600);
+      };
+
+      // Lookup Australian & Global barcode databases (Open Food Facts + Gemini Fallback)
+      const lookupBarcodeNutritionalData = async (rawBarcode) => {
+        const cleanBarcode = String(rawBarcode).replace(/\D/g, '');
+        if (!cleanBarcode || cleanBarcode.length < 6) {
+          showToast('Invalid barcode length');
+          return;
+        }
+
+        setIsScanningBarcode(true);
+        showToast(`Searching barcode ${cleanBarcode}...`);
+
+        try {
+          let found = false;
+          // 1. First attempt: Open Food Facts Australia / Global API
+          try {
+            const offRes = await fetch(`https://world.openfoodfacts.org/api/v2/product/${cleanBarcode}.json`, {
+              cache: 'no-cache'
+            });
+            if (offRes.ok) {
+              const offData = await offRes.json();
+              if (offData.status === 1 && offData.product) {
+                const prod = offData.product;
+                const nut = prod.nutriments || {};
+
+                let kcal = nut['energy-kcal_serving'] || nut['energy-kcal_100g'];
+                if (!kcal && (nut['energy_serving'] || nut['energy_100g'])) {
+                  kcal = Math.round((nut['energy_serving'] || nut['energy_100g']) / 4.184);
+                }
+
+                const name = prod.product_name_en || prod.product_name || prod.brands || 'Australian Grocery Product';
+                const p = Math.round(nut['proteins_serving'] || nut['proteins_100g'] || 0);
+                const c = Math.round(nut['carbohydrates_serving'] || nut['carbohydrates_100g'] || 0);
+                const s = Math.round(nut['sugars_serving'] || nut['sugars_100g'] || 0);
+                const na = Math.round((nut['sodium_serving'] || nut['sodium_100g'] || 0) * 1000);
+
+                const tags = [];
+                const allergens = `${prod.allergens_tags || []} ${prod.ingredients_text || ''}`.toLowerCase();
+                if (allergens.includes('milk') || allergens.includes('dairy') || allergens.includes('lactose')) tags.push('dairy');
+                if (allergens.includes('gluten') || allergens.includes('wheat')) tags.push('gluten');
+                if (allergens.includes('caffeine') || allergens.includes('coffee')) tags.push('caffeine');
+                if (s >= 15) tags.push('sugar');
+
+                setMealTitle(name);
+                setMealCalories(Math.round(kcal || 220));
+                setMealProtein(p);
+                setMealCarbs(c);
+                setMealSugar(s);
+                setMealSodium(na);
+                setMealTags(tags);
+                found = true;
+                showToast(`Loaded: ${name}`);
+              }
+            }
+          } catch (offErr) {
+            console.debug('OpenFoodFacts fetch failed, trying AI fallback...', offErr);
+          }
+
+          // 2. Second attempt: Gemini Search-Grounded Nutritional Estimation
+          if (!found) {
+            showToast('Querying Australian grocery database via AI...');
+            const systemPrompt = "You are an Australian supermarket and food database expert. Look up this Australian product barcode number or identify the likely product and its nutritional content per serving according to Australian Nutrition Information Panels (NIP). Return clean JSON.";
+            const userQuery = `Find the product details and nutritional information per serving for Australian Barcode EAN/UPC: ${cleanBarcode}. Provide realistic values for: productName, caloriesKcal, proteinG, carbsG, sugarG, sodiumMg, and sensitivity tags (selected from ["dairy", "gluten", "caffeine", "sugar", "fried"]).`;
+
+            const apiKey = "";
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`;
+
+            const payload = {
+              contents: [{ parts: [{ text: userQuery }] }],
+              systemInstruction: { parts: [{ text: systemPrompt }] },
+              generationConfig: {
+                responseMimeType: "application/json",
+                responseSchema: {
+                  type: "OBJECT",
+                  properties: {
+                    productName: { type: "STRING" },
+                    caloriesKcal: { type: "NUMBER" },
+                    proteinG: { type: "NUMBER" },
+                    carbsG: { type: "NUMBER" },
+                    sugarG: { type: "NUMBER" },
+                    sodiumMg: { type: "NUMBER" },
+                    tags: { type: "ARRAY", items: { type: "STRING" } }
+                  },
+                  required: ["productName", "caloriesKcal", "proteinG", "carbsG", "sugarG", "sodiumMg", "tags"]
+                }
+              }
+            };
+
+            const response = await fetch(apiUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            });
+            const data = await response.json();
+            const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (rawText) {
+              const parsed = JSON.parse(rawText);
+              setMealTitle(parsed.productName || `Product #${cleanBarcode}`);
+              setMealCalories(Math.round(parsed.caloriesKcal || 200));
+              setMealProtein(Math.round(parsed.proteinG || 0));
+              setMealCarbs(Math.round(parsed.carbsG || 0));
+              setMealSugar(Math.round(parsed.sugarG || 0));
+              setMealSodium(Math.round(parsed.sodiumMg || 0));
+              if (Array.isArray(parsed.tags)) {
+                setMealTags(parsed.tags.map(t => t.toLowerCase()));
+              }
+              showToast(`Identified: ${parsed.productName}`);
+              found = true;
+            }
+          }
+
+          if (!found) {
+            setMealTitle(`Scanned Barcode: ${cleanBarcode}`);
+            showToast('Barcode recognized! Enter description to estimate with AI.');
+          }
+        } catch (err) {
+          console.error(err);
+          showToast('Could not fetch barcode details.');
+        } finally {
+          setIsScanningBarcode(false);
+          stopBarcodeCamera();
+          setShowBarcodeScannerModal(false);
+        }
+      };
+
+      // Start Live Video Stream & Barcode Detection Loop
+      const startBarcodeScanner = async () => {
+        setShowBarcodeScannerModal(true);
+        isProcessingBarcodeRef.current = false;
+
+        try {
+          const constraints = {
+            video: {
+              facingMode: { ideal: 'environment' },
+              width: { ideal: 1280 },
+              height: { ideal: 720 }
+            },
+            audio: false
+          };
+
+          const stream = await navigator.mediaDevices.getUserMedia(constraints);
+          mediaStreamRef.current = stream;
+
+          if (videoRef.current) {
+            videoRef.current.srcObject = stream;
+            await videoRef.current.play();
+          }
+
+          // Check if native BarcodeDetector API is available in browser
+          let nativeDetector = null;
+          if ('BarcodeDetector' in window) {
+            try {
+              const formats = await BarcodeDetector.getSupportedFormats();
+              const desired = ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'qr_code'].filter(f => formats.includes(f));
+              nativeDetector = new BarcodeDetector({ formats: desired.length ? desired : formats });
+            } catch (e) {
+              console.debug('BarcodeDetector init fallback', e);
+            }
+          }
+
+          // ZXing fallback reader if BarcodeDetector is not natively supported
+          let zxingReader = null;
+          if (!nativeDetector && window.ZXing) {
+            try {
+              zxingReader = new ZXing.BrowserMultiFormatReader();
+            } catch (e) {
+              console.debug('ZXing reader init error', e);
+            }
+          }
+
+          // Continuous Frame Scanning Loop
+          const scanFrame = async () => {
+            if (!videoRef.current || isProcessingBarcodeRef.current) return;
+
+            if (videoRef.current.readyState === videoRef.current.HAVE_ENOUGH_DATA) {
+              try {
+                if (nativeDetector) {
+                  const barcodes = await nativeDetector.detect(videoRef.current);
+                  if (barcodes && barcodes.length > 0) {
+                    const code = barcodes[0].rawValue;
+                    if (code && !isProcessingBarcodeRef.current) {
+                      isProcessingBarcodeRef.current = true;
+                      if ('vibrate' in navigator) navigator.vibrate([40, 30, 40]);
+                      lookupBarcodeNutritionalData(code);
+                      return;
+                    }
+                  }
+                } else if (zxingReader) {
+                  try {
+                    const result = await zxingReader.decodeOnceFromVideoElement(videoRef.current);
+                    if (result && result.getText() && !isProcessingBarcodeRef.current) {
+                      isProcessingBarcodeRef.current = true;
+                      if ('vibrate' in navigator) navigator.vibrate([40, 30, 40]);
+                      lookupBarcodeNutritionalData(result.getText());
+                      return;
+                    }
+                  } catch (zxErr) {
+                    // Normal during scanning frames without barcode
+                  }
+                }
+              } catch (detectErr) {
+                // Continue scanning next frame
+              }
+            }
+
+            if (!isProcessingBarcodeRef.current) {
+              scanAnimationRef.current = requestAnimationFrame(scanFrame);
+            }
+          };
+
+          scanAnimationRef.current = requestAnimationFrame(scanFrame);
+        } catch (err) {
+          console.error('Camera permission/access error', err);
+          showToast('Could not access rear camera. Check browser permissions.');
+        }
+      };
+
+      const stopBarcodeCamera = () => {
+        if (scanAnimationRef.current) {
+          cancelAnimationFrame(scanAnimationRef.current);
+          scanAnimationRef.current = null;
+        }
+        if (mediaStreamRef.current) {
+          mediaStreamRef.current.getTracks().forEach(track => track.stop());
+          mediaStreamRef.current = null;
+        }
+        setScannerTorchOn(false);
+      };
+
+      const toggleScannerTorch = async () => {
+        if (!mediaStreamRef.current) return;
+        const track = mediaStreamRef.current.getVideoTracks()[0];
+        if (!track) return;
+
+        try {
+          const nextTorch = !scannerTorchOn;
+          await track.applyConstraints({
+            advanced: [{ torch: nextTorch }]
+          });
+          setScannerTorchOn(nextTorch);
+        } catch (e) {
+          showToast('Flashlight not supported on this lens');
+        }
       };
 
       // Barcode Upload and Australian OpenFoodFacts / Gemini Vision integration
@@ -1475,22 +1741,15 @@
                           Clear
                         </button>
 
-                        <label 
-                          className={`flex items-center space-x-1 px-2.5 py-1.5 rounded-xl bg-emerald-600/20 border border-emerald-500/40 text-emerald-300 text-xs font-semibold hover:bg-emerald-600/30 transition cursor-pointer ${
-                            isScanningBarcode ? 'opacity-50 pointer-events-none' : ''
-                          }`}
+                        <button
+                          type="button"
+                          onClick={startBarcodeScanner}
+                          className="flex items-center space-x-1.5 px-3 py-1.5 rounded-xl bg-emerald-600/20 border border-emerald-500/40 text-emerald-300 text-xs font-semibold hover:bg-emerald-600/30 transition active:scale-95 shadow-sm"
+                          title="Open live camera barcode scanner"
                         >
-                          <Icon name="Barcode" className={`w-3.5 h-3.5 ${isScanningBarcode ? 'animate-pulse' : ''}`} />
-                          <span>{isScanningBarcode ? 'Scanning...' : 'Barcode'}</span>
-                          <input
-                            type="file"
-                            accept="image/*"
-                            capture="environment"
-                            className="hidden"
-                            onChange={handleBarcodeUpload}
-                            disabled={isScanningBarcode}
-                          />
-                        </label>
+                          <Icon name="Barcode" className="w-3.5 h-3.5 text-emerald-400" />
+                          <span>Barcode Scanner</span>
+                        </button>
                       </div>
                     </div>
 
@@ -2861,6 +3120,141 @@
             )}
 
           </main>
+
+          {/* Live Barcode Scanner Camera Viewport Modal */}
+          {showBarcodeScannerModal && (
+            <div className="fixed inset-0 z-50 bg-black/95 backdrop-blur-md flex flex-col justify-between animate-in fade-in duration-200">
+              
+              {/* Scanner Top Bar */}
+              <div className="px-5 pt-safe pt-4 pb-3 flex items-center justify-between z-20 bg-gradient-to-b from-black/80 to-transparent">
+                <div className="flex items-center space-x-2">
+                  <div className="w-8 h-8 rounded-xl bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-emerald-300">
+                    <Icon name="Barcode" className="w-4 h-4 text-emerald-400" />
+                  </div>
+                  <div>
+                    <h3 className="text-sm font-bold text-white leading-tight">Australian Barcode Scanner</h3>
+                    <p className="text-[10px] text-emerald-400 font-mono">Live Reticle • EAN-13 & NIP</p>
+                  </div>
+                </div>
+
+                <div className="flex items-center space-x-2">
+                  <button
+                    type="button"
+                    onClick={toggleScannerTorch}
+                    className={`p-2 rounded-xl border transition ${
+                      scannerTorchOn 
+                        ? 'bg-amber-400 text-slate-950 border-amber-300 font-bold' 
+                        : 'bg-slate-900/80 border-slate-700 text-slate-300 hover:text-white'
+                    }`}
+                    title="Toggle Flashlight"
+                  >
+                    <Icon name="Zap" className="w-4 h-4" />
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      stopBarcodeCamera();
+                      setShowBarcodeScannerModal(false);
+                    }}
+                    className="p-2 rounded-xl bg-slate-900/80 border border-slate-700 text-slate-300 hover:text-white transition"
+                    title="Close Scanner"
+                  >
+                    <Icon name="X" className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+
+              {/* Viewport Reticle Box */}
+              <div className="relative flex-1 flex items-center justify-center overflow-hidden p-6">
+                <video
+                  ref={videoRef}
+                  playsInline
+                  muted
+                  className="absolute inset-0 w-full h-full object-cover"
+                />
+
+                {/* Dark Vignette Overlay with Center Window */}
+                <div className="absolute inset-0 bg-black/50 pointer-events-none"></div>
+
+                {/* Targeting Box */}
+                <div className="relative w-64 h-64 sm:w-72 sm:h-72 rounded-3xl border-2 border-emerald-400/80 shadow-[0_0_0_9999px_rgba(0,0,0,0.5)] flex items-center justify-center overflow-hidden">
+                  
+                  {/* Corner Target Accents */}
+                  <div className="absolute top-2 left-2 w-5 h-5 border-t-4 border-l-4 border-emerald-400 rounded-tl-lg"></div>
+                  <div className="absolute top-2 right-2 w-5 h-5 border-t-4 border-r-4 border-emerald-400 rounded-tr-lg"></div>
+                  <div className="absolute bottom-2 left-2 w-5 h-5 border-b-4 border-l-4 border-emerald-400 rounded-bl-lg"></div>
+                  <div className="absolute bottom-2 right-2 w-5 h-5 border-b-4 border-r-4 border-emerald-400 rounded-br-lg"></div>
+
+                  {/* Animated Laser Scanning Line */}
+                  <div className="absolute left-3 right-3 h-0.5 bg-gradient-to-r from-transparent via-emerald-400 to-transparent shadow-[0_0_12px_#34d399] scanner-laser-line"></div>
+
+                  <span className="text-[11px] font-semibold text-emerald-200/90 bg-black/60 px-3 py-1 rounded-full border border-emerald-500/30 backdrop-blur-sm pointer-events-none">
+                    Align barcode inside window
+                  </span>
+                </div>
+              </div>
+
+              {/* Scanner Bottom Action Controls */}
+              <div className="px-5 pb-safe pb-5 z-20 space-y-3 bg-gradient-to-t from-black via-black/90 to-transparent">
+                <div className="text-center text-xs text-slate-300">
+                  <span>Auto-detects Woolworths, Coles & Australian food products</span>
+                </div>
+
+                {/* Fallback Manual Entry Barcode Input */}
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={manualBarcodeCode}
+                    onChange={(e) => setManualBarcodeCode(e.target.value)}
+                    placeholder="Or type digits (e.g. 9300633...)"
+                    className="flex-1 bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white placeholder:text-slate-500 font-mono focus:outline-none focus:border-emerald-400"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (manualBarcodeCode.trim()) {
+                        lookupBarcodeNutritionalData(manualBarcodeCode);
+                      }
+                    }}
+                    disabled={!manualBarcodeCode.trim() || isScanningBarcode}
+                    className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition disabled:opacity-40 shrink-0"
+                  >
+                    Lookup
+                  </button>
+                </div>
+
+                <div className="flex gap-2">
+                  <label className="flex-1 py-2.5 rounded-xl bg-slate-900 border border-slate-800 text-slate-300 hover:text-white text-xs font-semibold flex items-center justify-center space-x-1.5 cursor-pointer active:scale-95 transition">
+                    <Icon name="Camera" className="w-3.5 h-3.5 text-indigo-400" />
+                    <span>Upload Packaging Photo</span>
+                    <input
+                      type="file"
+                      accept="image/*"
+                      className="hidden"
+                      onChange={(e) => {
+                        stopBarcodeCamera();
+                        setShowBarcodeScannerModal(false);
+                        handleBarcodeUpload(e);
+                      }}
+                    />
+                  </label>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      stopBarcodeCamera();
+                      setShowBarcodeScannerModal(false);
+                    }}
+                    className="px-5 py-2.5 rounded-xl bg-slate-800 text-slate-300 hover:text-white text-xs font-semibold transition"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+
+            </div>
+          )}
 
           {/* Dedicated Modal 1: Daily Goals & Targets (Moved Out of Settings) */}
           {showGoalsModal && (
