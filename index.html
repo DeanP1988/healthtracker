@@ -168,6 +168,10 @@
     .pb-safe {
       padding-bottom: env(safe-area-inset-bottom, 24px);
     }
+    /* Extra safe-area clearance for modal top overlays below Dynamic Island / Notch */
+    .pt-safe-topbar {
+      padding-top: calc(env(safe-area-inset-top, 20px) + 1.25rem);
+    }
 
     /* Live Barcode Scanner Laser Animation */
     @keyframes scanner-laser {
@@ -3125,19 +3129,19 @@
           {showBarcodeScannerModal && (
             <div className="fixed inset-0 z-50 bg-black/95 backdrop-blur-md flex flex-col justify-between animate-in fade-in duration-200">
               
-              {/* Scanner Top Bar */}
-              <div className="px-5 pt-safe pt-4 pb-3 flex items-center justify-between z-20 bg-gradient-to-b from-black/80 to-transparent">
-                <div className="flex items-center space-x-2">
-                  <div className="w-8 h-8 rounded-xl bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-emerald-300">
+              {/* Scanner Top Bar - Shifted down below iPhone Dynamic Island, Notch & Status Bar */}
+              <div className="px-5 pt-safe-topbar pb-3.5 flex items-center justify-between z-20 bg-gradient-to-b from-black/95 via-black/80 to-transparent">
+                <div className="flex items-center space-x-2.5">
+                  <div className="w-8 h-8 rounded-xl bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-emerald-300 shrink-0">
                     <Icon name="Barcode" className="w-4 h-4 text-emerald-400" />
                   </div>
                   <div>
                     <h3 className="text-sm font-bold text-white leading-tight">Australian Barcode Scanner</h3>
-                    <p className="text-[10px] text-emerald-400 font-mono">Live Reticle • EAN-13 & NIP</p>
+                    <p className="text-[10px] text-emerald-400 font-mono mt-0.5">Live Reticle • EAN-13 & NIP</p>
                   </div>
                 </div>
 
-                <div className="flex items-center space-x-2">
+                <div className="flex items-center space-x-2 shrink-0">
                   <button
                     type="button"
                     onClick={toggleScannerTorch}
